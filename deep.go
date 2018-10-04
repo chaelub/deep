@@ -12,25 +12,6 @@ import (
 )
 
 var (
-	// FloatPrecision is the number of decimal places to round float values
-	// to when comparing.
-	FloatPrecision = 10
-
-	// MaxDiff specifies the maximum number of differences to return.
-	MaxDiff = 10
-
-	// MaxDepth specifies the maximum levels of a struct to recurse into.
-	MaxDepth = 10
-
-	// LogErrors causes errors to be logged to STDERR when true.
-	LogErrors = false
-
-	// CompareUnexportedFields causes unexported struct fields, like s in
-	// T{s int}, to be comparsed when true.
-	CompareUnexportedFields = false
-)
-
-var (
 	// ErrMaxRecursion is logged when MaxDepth is reached.
 	ErrMaxRecursion = errors.New("recursed to MaxDepth")
 
@@ -39,12 +20,44 @@ var (
 
 	// ErrNotHandled is logged when a primitive Go kind is not handled.
 	ErrNotHandled = errors.New("cannot compare the reflect.Kind")
+
+	DefaultOptions = Options{
+		FloatPrecision:          10,
+		MaxDiff:                 10,
+		MaxDepth:                10,
+		LogErrors:               false,
+		CompareUnexportedFields: false,
+	}
 )
+
+type Options struct {
+	// FloatPrecision is the number of decimal places to round float values
+	// to when comparing.
+	FloatPrecision int
+	// MaxDiff specifies the maximum number of differences to return.
+	MaxDiff int
+	// MaxDepth specifies the maximum levels of a struct to recurse into.
+	MaxDepth int
+	// LogErrors causes errors to be logged to STDERR when true.
+	LogErrors bool
+	// CompareUnexportedFields causes unexported struct fields, like s in
+	// T{s int}, to be comparsed when true.
+	CompareUnexportedFields bool
+
+	asMap bool
+}
+
+type DiffResult struct {
+	OldValue interface{}
+	NewValue interface{}
+}
 
 type cmp struct {
 	diff        []string
+	diffM       map[string]DiffResult
 	buff        []string
 	floatFormat string
+	opts        Options
 }
 
 var errorType = reflect.TypeOf((*error)(nil)).Elem()
@@ -55,35 +68,66 @@ var errorType = reflect.TypeOf((*error)(nil)).Elem()
 //
 // If a type has an Equal method, like time.Equal, it is called to check for
 // equality.
-func Equal(a, b interface{}) []string {
+
+func CompareM(a, b interface{}, opts ...Options) (map[string]DiffResult, bool) {
+	var o Options
+	if len(opts) > 0 {
+		o = opts[0]
+	} else {
+		o = DefaultOptions
+	}
+	o.asMap = true
+	if c, hasDiff := compare(a, b, o); hasDiff {
+		return c.diffM, hasDiff
+	}
+	return nil, false
+}
+
+func CompareS(a, b interface{}, opts ...Options) ([]string, bool) {
+	var o Options
+	if len(opts) > 0 {
+		o = opts[0]
+	} else {
+		o = DefaultOptions
+	}
+	if c, hasDiff := compare(a, b, o); hasDiff {
+		return c.diff, hasDiff
+	}
+	return nil, false
+}
+
+func compare(a, b interface{}, opts Options) (c *cmp, hasDiff bool) {
 	aVal := reflect.ValueOf(a)
 	bVal := reflect.ValueOf(b)
-	c := &cmp{
+	c = &cmp{
 		diff:        []string{},
+		diffM:       make(map[string]DiffResult),
 		buff:        []string{},
-		floatFormat: fmt.Sprintf("%%.%df", FloatPrecision),
+		opts:        opts,
+		floatFormat: fmt.Sprintf("%%.%df", opts.FloatPrecision),
 	}
+
 	if a == nil && b == nil {
-		return nil
+		return
 	} else if a == nil && b != nil {
 		c.saveDiff(b, "<nil pointer>")
 	} else if a != nil && b == nil {
 		c.saveDiff(a, "<nil pointer>")
 	}
 	if len(c.diff) > 0 {
-		return c.diff
+		return c, true
 	}
 
 	c.equals(aVal, bVal, 0)
-	if len(c.diff) > 0 {
-		return c.diff // diffs
+	if len(c.diff) > 0 || len(c.diffM) > 0 {
+		return c, true
 	}
-	return nil // no diffs
+	return
 }
 
 func (c *cmp) equals(a, b reflect.Value, level int) {
-	if level > MaxDepth {
-		logError(ErrMaxRecursion)
+	if level > c.opts.MaxDepth {
+		c.logError(ErrMaxRecursion)
 		return
 	}
 
@@ -102,7 +146,7 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 	bType := b.Type()
 	if aType != bType {
 		c.saveDiff(aType, bType)
-		logError(ErrTypeMismatch)
+		c.logError(ErrTypeMismatch)
 		return
 	}
 
@@ -181,11 +225,21 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 		}
 
 		for i := 0; i < a.NumField(); i++ {
-			if aType.Field(i).PkgPath != "" && !CompareUnexportedFields {
+			if aType.Field(i).PkgPath != "" && !c.opts.CompareUnexportedFields {
 				continue // skip unexported field, e.g. s in type T struct {s string}
 			}
 
-			c.push(aType.Field(i).Name) // push field name to buff
+			tagOpts := getTagOpts(aType.Field(i).Tag.Get("compare"))
+			if tagOpts.skip {
+				continue
+			}
+
+			// push field name to buff
+			if tagOpts.exists {
+				c.push(tagOpts.name)
+			} else {
+				c.push(aType.Field(i).Name)
+			}
 
 			// Get the Value for each field, e.g. FirstName has Type = string,
 			// Kind = reflect.String.
@@ -197,7 +251,7 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 
 			c.pop() // pop field name from buff
 
-			if len(c.diff) >= MaxDiff {
+			if len(c.diff) >= c.opts.MaxDiff {
 				break
 			}
 		}
@@ -219,9 +273,9 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 
 		if a.IsNil() || b.IsNil() {
 			if a.IsNil() && !b.IsNil() {
-				c.saveDiff("<nil map>", b)
+				c.saveDiff("[empty value]", b.Interface())
 			} else if !a.IsNil() && b.IsNil() {
-				c.saveDiff(a, "<nil map>")
+				c.saveDiff(a.Interface(), "[empty value]")
 			}
 			return
 		}
@@ -231,19 +285,19 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 		}
 
 		for _, key := range a.MapKeys() {
-			c.push(fmt.Sprintf("map[%s]", key))
+			c.push(fmt.Sprintf("%s", key))
 
 			aVal := a.MapIndex(key)
 			bVal := b.MapIndex(key)
 			if bVal.IsValid() {
 				c.equals(aVal, bVal, level+1)
 			} else {
-				c.saveDiff(aVal, "<does not have key>")
+				c.saveDiff(aVal.Interface(), "[empty value]")
 			}
 
 			c.pop()
 
-			if len(c.diff) >= MaxDiff {
+			if len(c.diff) >= c.opts.MaxDiff {
 				return
 			}
 		}
@@ -253,29 +307,29 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 				continue
 			}
 
-			c.push(fmt.Sprintf("map[%s]", key))
-			c.saveDiff("<does not have key>", b.MapIndex(key))
+			c.push(key.String())
+			c.saveDiff("[empty value]", b.MapIndex(key).Interface())
 			c.pop()
-			if len(c.diff) >= MaxDiff {
+			if len(c.diff) >= c.opts.MaxDiff {
 				return
 			}
 		}
 	case reflect.Array:
 		n := a.Len()
 		for i := 0; i < n; i++ {
-			c.push(fmt.Sprintf("array[%d]", i))
+			c.push(fmt.Sprintf("#%d", i))
 			c.equals(a.Index(i), b.Index(i), level+1)
 			c.pop()
-			if len(c.diff) >= MaxDiff {
+			if len(c.diff) >= c.opts.MaxDiff {
 				break
 			}
 		}
 	case reflect.Slice:
 		if a.IsNil() || b.IsNil() {
 			if a.IsNil() && !b.IsNil() {
-				c.saveDiff("<nil slice>", b)
+				c.saveDiff("[empty value]", b)
 			} else if !a.IsNil() && b.IsNil() {
-				c.saveDiff(a, "<nil slice>")
+				c.saveDiff(a, "[empty value]")
 			}
 			return
 		}
@@ -291,16 +345,16 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 			n = bLen
 		}
 		for i := 0; i < n; i++ {
-			c.push(fmt.Sprintf("slice[%d]", i))
+			c.push(fmt.Sprintf("#%d", i))
 			if i < aLen && i < bLen {
 				c.equals(a.Index(i), b.Index(i), level+1)
 			} else if i < aLen {
-				c.saveDiff(a.Index(i), "<no value>")
+				c.saveDiff(a.Index(i), "[empty value]")
 			} else {
-				c.saveDiff("<no value>", b.Index(i))
+				c.saveDiff("[empty value]", b.Index(i))
 			}
 			c.pop()
-			if len(c.diff) >= MaxDiff {
+			if len(c.diff) >= c.opts.MaxDiff {
 				break
 			}
 		}
@@ -335,7 +389,7 @@ func (c *cmp) equals(a, b reflect.Value, level int) {
 		}
 
 	default:
-		logError(ErrNotHandled)
+		c.logError(ErrNotHandled)
 	}
 }
 
@@ -352,14 +406,47 @@ func (c *cmp) pop() {
 func (c *cmp) saveDiff(aval, bval interface{}) {
 	if len(c.buff) > 0 {
 		varName := strings.Join(c.buff, ".")
+		if c.opts.asMap {
+			c.diffM[varName] = DiffResult{
+				OldValue: aval,
+				NewValue: bval,
+			}
+			return
+		}
 		c.diff = append(c.diff, fmt.Sprintf("%s: %v != %v", varName, aval, bval))
 	} else {
+		if c.opts.asMap {
+			c.diffM["result"] = DiffResult{
+				OldValue: aval,
+				NewValue: bval,
+			}
+		}
 		c.diff = append(c.diff, fmt.Sprintf("%v != %v", aval, bval))
 	}
 }
 
-func logError(err error) {
-	if LogErrors {
+func (c *cmp) logError(err error) {
+	if c.opts.LogErrors {
 		log.Println(err)
 	}
+}
+
+type tagOptions struct {
+	exists bool
+	name   string
+	skip   bool
+}
+
+func getTagOpts(tagV string) tagOptions {
+	opts := tagOptions{}
+	if len(tagV) > 0 {
+		opts.exists = true
+	}
+	if od := strings.Split(tagV, ","); len(od) > 1 {
+		opts.name = od[0]
+		opts.skip = true
+	} else {
+		opts.name = tagV
+	}
+	return opts
 }
